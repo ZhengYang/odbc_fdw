@@ -1,1 +1,45 @@
-ODBC FDW
+ODBC FDW (beta) for PostgreSQL 9.1+
+===================================
+
+This PostgreSQL extension implements a Foreign Data Wrapper (FDW) for
+remote databases using Open Database Connectivity(ODBC): http://en.wikipedia.org/wiki/Open_Database_Connectivity
+
+IMPORTANT: There're bugs in the existing version. I'm working on it and will
+be releasing another version very soon.
+
+
+Building
+--------
+
+
+Limitations
+-----------
+
+
+Usage
+-----
+
+The following parameters can be set on a CouchDB foreign server:
+
+dsn:	Database Source Name
+	 	Default: myodbc
+
+
+Example
+-------
+
+CREATE SERVER odbc_server 
+	FOREIGN DATA WRAPPER odbc_fdw 
+	OPTIONS (dsn 'mydsn');
+
+CREATE FOREIGN TABLE odbc_table (name text, age text) 
+	SERVER odbc_server
+	OPTIONS (database 'testdb', name 'myname', age 'myage');
+
+CREATE USER MAPPING FOR PUBLIC
+	SERVER odbc_server
+	OPTIONS ();
+
+-- 
+Zheng Yang
+zhengyang4k@gmail.com
