@@ -44,13 +44,12 @@ PG_MODULE_MAGIC;
 
 #define PROCID_TEXTEQ 67
 
+//static SQLHSTMT stmt;
 
 typedef struct odbcFdwExecutionState
 {
 	AttInMetadata	*attinmeta;
-	SQLHENV	*env;
-	SQLHDBC	*dbc;
-	SQLHSTMT	*stmt;
+	SQLHSTMT	stmt;
 } odbcFdwExecutionState;
 
 struct odbcFdwOption
@@ -175,10 +174,9 @@ odbcBeginForeignScan(ForeignScanState *node, int eflags)
 {
 	SQLHENV env;
 	SQLHDBC dbc;
-	SQLHSTMT stmt;
 	odbcFdwExecutionState	*festate;
 	SQLSMALLINT columns;
-	
+	SQLHSTMT stmt;
 	elog(NOTICE, "odbcBeginForeignScan");
 	
     /* Allocate an environment handle */
@@ -207,15 +205,12 @@ odbcBeginForeignScan(ForeignScanState *node, int eflags)
 	SQLExecDirect(stmt, "USE test", SQL_NTS);
 	SQLExecDirect(stmt, "SELECT * FROM mytable", SQL_NTS);
 	SQLNumResultCols(stmt, &columns);
-	elog(NOTICE, "num of column (begin): %i", (int) columns);
-	SQLFetch(stmt);
+	elog(NOTICE, "num of columns (begin): %i", (int) columns);
 	
 	festate = (odbcFdwExecutionState *) palloc(sizeof(odbcFdwExecutionState));
 	festate->attinmeta = TupleDescGetAttInMetadata(node->ss.ss_currentRelation->rd_att);
-	festate->stmt = &stmt;
+	festate->stmt = stmt;
 	elog(NOTICE, "STMT (begin): %p", &stmt);
-	festate->dbc = &dbc;
-	festate->env = &env;
 	node->fdw_state = (void *) festate;
 }
 
@@ -234,47 +229,52 @@ odbcIterateForeignScan(ForeignScanState *node)
 	SQLSMALLINT columns;
 	char	**values;
 	HeapTuple	tuple;
-	SQLHSTMT *stmt = festate->stmt;
+	SQLHSTMT stmt = festate->stmt;
 	
 	elog(NOTICE, "odbcIterateForeignScan");
-	elog(NOTICE, "STMT (iterate): %p", stmt);
-	ret = SQLFetch(*stmt);
+	ret = SQLFetch(stmt);
 	
-	
-	
-	if (ret==SQL_SUCCESS) {
-		elog(NOTICE, "fetched");
-	}
-	else {
-		extract_error("SQLFetch", *stmt, SQL_HANDLE_STMT);
-	}
-
-
+	SQLNumResultCols(stmt, &columns);
+	elog(NOTICE, "num of columns (iterate): %i", (int) columns);
 	
 	ExecClearTuple(slot);
 	
 	if (SQL_SUCCEEDED(ret)) {
-		SQLUSMALLINT i;
+		SQLSMALLINT i;
 		values = (char **) palloc(sizeof(char *) * columns);
 		/* Loop through the columns */
 		for (i = 1; i <= columns; i++) {
-			SQLINTEGER indicator;
+			SQLLEN indicator;
 			char buf[512];
-			/* retrieve column data as a string */
-			ret = SQLGetData(*stmt, i, SQL_C_CHAR,
-							 buf, sizeof(buf), &indicator);
 			
+			elog(NOTICE, "1columns: %i", columns);
+
+			/* retrieve column data as a string */
+			ret = SQLGetData(stmt, i, SQL_C_CHAR,
+							 buf, sizeof(buf), &indicator);
+			//SQLNumResultCols(stmt, &columns);
+			elog(NOTICE, "2columns: %i", columns);
 			if (SQL_SUCCEEDED(ret)) {
 				
 				/* Handle null columns */
 				if (indicator == SQL_NULL_DATA) strcpy(buf, "NULL");
-				values[i-1] = buf;
+				StringInfoData temp;
+				initStringInfo(&temp);
+				appendStringInfoString (&temp, buf);
+				values[i-1] = temp.data;
+				
+				elog(NOTICE, "values[%i] = %s", i-1, values[i-1]);
+
 			}
 		}
+		
+		elog(NOTICE, "0:%s", values[0]);
+		elog(NOTICE, "1:%s", values[1]);
+		
 		tuple = BuildTupleFromCStrings(festate->attinmeta, values);
 		ExecStoreTuple(tuple, slot, InvalidBuffer, false);
 	}
-	
+	elog(NOTICE, "iterate end");
 	return slot;
 }
 
