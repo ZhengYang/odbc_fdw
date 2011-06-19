@@ -43,12 +43,18 @@
 PG_MODULE_MAGIC;
 
 #define PROCID_TEXTEQ 67
+#define PROCID_TEXTCONST 25
 
 
 typedef struct odbcFdwExecutionState
 {
 	AttInMetadata	*attinmeta;
-	SQLHSTMT	stmt;
+	char			*svr_dsn;
+	char			*svr_database;
+	char			*svr_table;
+	char			*svr_username;
+	char			*svr_password;
+	SQLHSTMT		stmt;
 } odbcFdwExecutionState;
 
 struct odbcFdwOption
@@ -64,10 +70,10 @@ struct odbcFdwOption
 static struct odbcFdwOption valid_options[] =
 {
     /* Foreign server options */
-    { "dsn",    ForeignServerRelationId },
+	{ "dsn",    ForeignServerRelationId },
 
     /* Foreign table options */
-    { "database",   ForeignTableRelationId },
+	{ "database",   ForeignTableRelationId },
 	{ "table",		ForeignTableRelationId },
 	
 	/* User mapping options */
@@ -134,7 +140,9 @@ odbc_fdw_validator(PG_FUNCTION_ARGS)
     char	*password = NULL;
     ListCell	*cell;
 	
+#ifdef DEBUG	
     elog(NOTICE, "odbc_fdw_validator");
+#endif
 	
     /*
      * Check that the necessary options: address, port, database
@@ -245,8 +253,10 @@ odbcGetOptions(Oid foreigntableid, char **svr_dsn, char **svr_database, char ** 
     UserMapping	*mapping;
     List		*options;
     ListCell	*lc;
-	
+
+#ifdef DEBUG
     elog(NOTICE, "odbcGetOptions");
+#endif
 	
     /*
      * Extract options from FDW objects.
@@ -299,8 +309,9 @@ odbcGetOptions(Oid foreigntableid, char **svr_dsn, char **svr_database, char ** 
         *mapping_list = lappend(*mapping_list, def);
     }
 	
-	
+#ifdef DEBUG
     elog(NOTICE, "list length: %i", (*mapping_list)->length);
+#endif
 	
     /* Default values, if required */
 	if (!*svr_dsn)
@@ -319,6 +330,195 @@ odbcGetOptions(Oid foreigntableid, char **svr_dsn, char **svr_database, char ** 
         *password = NULL;
 }
 
+void static extract_error(
+						  char *fn,
+						  SQLHANDLE handle,
+						  SQLSMALLINT type)
+{
+    SQLINTEGER	 i = 0;
+    SQLINTEGER	 native;
+    SQLCHAR	 state[ 7 ];
+    SQLCHAR	 text[256];
+    SQLSMALLINT	 len;
+    SQLRETURN	 ret;
+	
+    elog(NOTICE,
+		 "\n"
+		 "The driver reported the following diagnostics whilst running "
+		 "%s\n\n",
+		 fn);
+	
+    do
+    {
+        ret = SQLGetDiagRec(type, handle, ++i, state, &native, text,
+                            sizeof(text), &len );
+        if (SQL_SUCCEEDED(ret))
+            elog(NOTICE, "%s:%ld:%ld:%s\n", state, (long int) i, (long int) native, text);
+    }
+    while( ret == SQL_SUCCESS );
+}
+
+/*
+ * get table size of a table
+ */
+static void
+odbcGetTableSize(char *svr_dsn, char *svr_database, char *svr_table, char *username, char *password, unsigned int *size)
+{
+	SQLHENV env;
+	SQLHDBC dbc;
+	SQLHSTMT stmt;
+	SQLRETURN ret;
+	
+	StringInfoData	conn_str;
+	StringInfoData	sql_str;
+	SQLCHAR OutConnStr[1024];
+	SQLSMALLINT OutConnStrLen;
+	
+	SQLUBIGINT table_size;
+	SQLLEN indicator;
+	
+	/* Construct connection string */
+	initStringInfo(&conn_str);
+	appendStringInfo(&conn_str, "DSN=%s;DATABASE=%s;UID=%s;PWD=%s;", svr_dsn, svr_database, username, password);
+#ifdef DEBUG
+	elog(NOTICE, "Connection string: %s", conn_str.data);
+#endif
+	/* Allocate an environment handle */
+	SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &env);
+	/* We want ODBC 3 support */
+	SQLSetEnvAttr(env, SQL_ATTR_ODBC_VERSION, (void *) SQL_OV_ODBC3, 0);
+	/* Allocate a connection handle */
+	SQLAllocHandle(SQL_HANDLE_DBC, env, &dbc);
+	
+	/* Connect to the DSN */
+	ret = SQLDriverConnect(dbc, NULL, (SQLCHAR *) conn_str.data, SQL_NTS,
+						   OutConnStr, 1024, &OutConnStrLen, SQL_DRIVER_COMPLETE);
+	
+#ifdef DEBUG
+	if (SQL_SUCCEEDED(ret)) 
+		elog(NOTICE, "Successfully connected to driver");
+	else {
+		extract_error("SQLDriverConnect", dbc, SQL_HANDLE_DBC);
+	}
+#endif
+	
+	/* Allocate a statement handle */
+	SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
+	
+	initStringInfo(&sql_str);
+	appendStringInfo(&sql_str, "SELECT COUNT(*) FROM `%s`.`%s`", svr_database, svr_table);
+	
+	ret = SQLExecDirect(stmt, (SQLCHAR *) sql_str.data, SQL_NTS);
+	if (SQL_SUCCEEDED(ret)) {
+		SQLFetch(stmt);
+		/* retrieve column data as a big int */
+		ret = SQLGetData(stmt, 1, SQL_C_UBIGINT, &table_size, 0, &indicator);
+		if (SQL_SUCCEEDED(ret)) {
+			*size = (unsigned int) table_size;
+		}
+	}
+	else {
+		elog(NOTICE, "Opps!");
+	}
+	
+	/* Free handles, and disconnect */   
+	if (stmt) { 
+		SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+		stmt = NULL; 
+	}
+	if (dbc) { 
+		SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+		dbc = NULL; 
+	}
+	if (env) { 
+		SQLFreeHandle(SQL_HANDLE_ENV, env);
+		env = NULL; 
+	}
+	if (dbc)
+		SQLDisconnect(dbc);
+#ifdef DEBUG
+	elog(NOTICE, "Count:   %u", *size);
+#endif
+}
+
+/*
+ * get quals in the select if there is one
+ */
+static void
+odbcGetQual(Node *node, TupleDesc tupdesc, List *col_mapping_list, char **key, char **value, bool *pushdown)
+{
+    ListCell *col_mapping;
+    *key = NULL;
+    *value = NULL;
+    *pushdown = false;
+#ifdef DEBUG	
+    elog(NOTICE, "odbcGetQual");
+#endif
+    if (!node)
+        return;
+	
+    if (IsA(node, OpExpr))
+    {
+        OpExpr	*op = (OpExpr *) node;
+        Node	*left, *right;
+        Index	varattno;
+		
+        if (list_length(op->args) != 2)
+            return;
+
+        left = list_nth(op->args, 0);
+		
+        if (!IsA(left, Var))
+            return;
+		
+        varattno = ((Var *) left)->varattno;
+		
+        right = list_nth(op->args, 1);
+		
+        if (IsA(right, Const))
+        {
+            StringInfoData  buf;
+            initStringInfo(&buf);
+            /* And get the column and value... */
+            *key = NameStr(tupdesc->attrs[varattno - 1]->attname);
+#ifdef DEBUG
+			elog(NOTICE, "constant type: %u", ((Const *) right)->consttype);
+#endif
+			if (((Const *) right)->consttype == PROCID_TEXTCONST)
+				*value = TextDatumGetCString(((Const *) right)->constvalue);
+			else {
+				return;
+			}
+			
+            /* convert qual keys to mapped couchdb attribute name */
+            foreach(col_mapping, col_mapping_list)
+            {
+                DefElem *def = (DefElem *) lfirst(col_mapping);
+                if (strcmp(def->defname, *key) == 0)
+                {
+                    *key = defGetString(def);
+                    break;
+                }
+            }
+			
+            /*
+             * We can push down this qual if:
+             * - The operatory is TEXTEQ
+             * - The qual is on the _id column (in addition, _rev column can be also valid)
+             */
+			
+            if (op->opfuncid == PROCID_TEXTEQ)
+                *pushdown = true;
+#ifdef DEBUG
+            elog(NOTICE, "Got qual %s = %s", *key, *value);
+#endif
+            return;
+        }
+    }
+	
+    return;
+}
+
 
 
 /*
@@ -329,8 +529,10 @@ static bool
 odbcIsValidOption(const char *option, Oid context)
 {
     struct odbcFdwOption *opt;
-	
+
+#ifdef DEBUG
     elog(NOTICE, "odbcIsValidOption");
+#endif
 	
     /* Check if the options presents in the valid option list */
     for (opt = valid_options; opt->optname; opt++)
@@ -347,6 +549,7 @@ odbcIsValidOption(const char *option, Oid context)
 }
 
 
+
 /*
  * odbcPlanForeignScan
  *		Create a FdwPlan for a scan on the foreign table
@@ -354,42 +557,41 @@ odbcIsValidOption(const char *option, Oid context)
 static FdwPlan *
 odbcPlanForeignScan(Oid foreigntableid, PlannerInfo *root, RelOptInfo *baserel)
 {
-	elog(NOTICE, "odbcPlanForeignScan");
-	
-    FdwPlan	*fdwplan;
-    
-    fdwplan = makeNode(FdwPlan);
+	FdwPlan	*fdwplan;
+	unsigned int table_size	= 0;
+	char *svr_dsn			= NULL;
+	char *svr_database		= NULL;
+	char *svr_table			= NULL;
+	char *username			= NULL;
+	char *password			= NULL;
+	List *col_mapping_list;
 
+#ifdef DEBUG
+    elog(NOTICE, "odbcPlanForeignScan");
+#endif
+	
+	/* Fetch the foreign table options */
+	odbcGetOptions(foreigntableid, &svr_dsn, &svr_database, &svr_table, 
+				   &username, &password, &col_mapping_list);
+	
+	fdwplan = makeNode(FdwPlan);
+	fdwplan->startup_cost = 10;
+    fdwplan->total_cost = 100 + fdwplan->startup_cost;
+    fdwplan->fdw_private = NIL;	/* not used */
+
+#ifdef DEBUG
+	elog(NOTICE, "new total cost: %f", fdwplan->total_cost);
+#endif
+	
+	odbcGetTableSize(svr_dsn, svr_database, svr_table, username, password, &table_size);
+	
+	fdwplan->total_cost = fdwplan->total_cost + table_size;
+#ifdef DEBUG
+	elog(NOTICE, "new total cost: %f", fdwplan->total_cost);
+#endif
     return fdwplan;
 }
 
-void static extract_error(
-				   char *fn,
-				   SQLHANDLE handle,
-				   SQLSMALLINT type)
-{
-    SQLINTEGER	 i = 0;
-    SQLINTEGER	 native;
-    SQLCHAR	 state[ 7 ];
-    SQLCHAR	 text[256];
-    SQLSMALLINT	 len;
-    SQLRETURN	 ret;
-	
-    elog(NOTICE,
-            "\n"
-            "The driver reported the following diagnostics whilst running "
-            "%s\n\n",
-            fn);
-	
-    do
-    {
-        ret = SQLGetDiagRec(type, handle, ++i, state, &native, text,
-                            sizeof(text), &len );
-        if (SQL_SUCCEEDED(ret))
-            elog(NOTICE, "%s:%ld:%ld:%s\n", state, i, native, text);
-    }
-    while( ret == SQL_SUCCESS );
-}
 
 
 
@@ -407,23 +609,23 @@ odbcBeginForeignScan(ForeignScanState *node, int eflags)
 	odbcFdwExecutionState	*festate;
 	SQLSMALLINT result_columns;
 	SQLHSTMT stmt;
+	SQLRETURN ret;
+	SQLCHAR OutConnStr[1024];
+	SQLSMALLINT OutConnStrLen;
+	
+#ifdef DEBUG
 	char dsn[256];
 	char desc[256];
 	SQLSMALLINT dsn_ret;
 	SQLSMALLINT desc_ret;
 	SQLUSMALLINT direction;
-	SQLRETURN ret;
-	
-	SQLCHAR OutConnStr[255];
-	SQLSMALLINT OutConnStrLen;
-	
+#endif
 	
 	char *svr_dsn		= NULL;
 	char *svr_database	= NULL;
 	char *svr_table	= NULL;
 	char *username		= NULL;
 	char *password		= NULL;
-	List *mapping_list;
 	
 	StringInfoData conn_str;
 	
@@ -436,51 +638,62 @@ odbcBeginForeignScan(ForeignScanState *node, int eflags)
 	StringInfoData	sql;
 	StringInfoData	col_str;
 	
+	char	*qual_key = NULL;
+	char	*qual_value = NULL;
+	bool	pushdown = FALSE;
 	
-	
+#ifdef DEBUG	
 	elog(NOTICE, "odbcBeginForeignScan");
-	
+#endif
 	
 	/* Fetch the foreign table options */
 	odbcGetOptions(RelationGetRelid(node->ss.ss_currentRelation), &svr_dsn, &svr_database, &svr_table, 
 				   &username, &password, &col_mapping_list);
-	
+#ifdef DEBUG	
 	elog(NOTICE, "dsn: %s", svr_dsn);
 	elog(NOTICE, "db: %s", svr_database);
 	elog(NOTICE, "table: %s", svr_table);
 	elog(NOTICE, "username: %s", username);
 	elog(NOTICE, "password: %s", password);
+#endif
 	initStringInfo(&conn_str);
 	appendStringInfo(&conn_str, "DSN=%s;DATABASE=%s;UID=%s;PWD=%s;", svr_dsn, svr_database, username, password);
-	elog(NOTICE, "connection string: %s", conn_str.data);
 	
+#ifdef DEBUG
+	elog(NOTICE, "connection string: %s", conn_str.data);
+#endif
 	
     /* Allocate an environment handle */
 	SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &env);
 	/* We want ODBC 3 support */
 	SQLSetEnvAttr(env, SQL_ATTR_ODBC_VERSION, (void *) SQL_OV_ODBC3, 0);
 	
+	
+#ifdef DEBUG
 	/* Print DSNs available: for debugging purposes */
 	direction = SQL_FETCH_FIRST;
 	while(SQL_SUCCEEDED(ret = SQLDataSources(env, direction,
-											 dsn, sizeof(dsn), &dsn_ret,
-											 desc, sizeof(desc), &desc_ret))) {
+											 (SQLCHAR *) dsn, sizeof(dsn), &dsn_ret,
+											 (SQLCHAR *) desc, sizeof(desc), &desc_ret))) {
 		direction = SQL_FETCH_NEXT;
 		elog(NOTICE, "%s - %s", dsn, desc);
 		if (ret == SQL_SUCCESS_WITH_INFO) elog(NOTICE, "data truncation");
 	}
+#endif
 	
 	/* Allocate a connection handle */
 	SQLAllocHandle(SQL_HANDLE_DBC, env, &dbc);
 	/* Connect to the DSN */
-	ret = SQLDriverConnect(dbc, NULL, conn_str.data, SQL_NTS,
-					 OutConnStr, OutConnStrLen, NULL, SQL_DRIVER_COMPLETE);
-	
+	ret = SQLDriverConnect(dbc, NULL, (SQLCHAR *) conn_str.data, SQL_NTS,
+					 OutConnStr, 1024, &OutConnStrLen, SQL_DRIVER_COMPLETE);
+
+#ifdef DEBUG
 	if (SQL_SUCCEEDED(ret)) 
 		elog(NOTICE, "Successfully connected to driver");
 	else {
 		extract_error("SQLDriverConnect", dbc, SQL_HANDLE_DBC);
 	}
+#endif
 	
 	/* Fetch the table column info */
     rel = heap_open(RelationGetRelid(node->ss.ss_currentRelation), AccessShareLock);
@@ -519,28 +732,62 @@ odbcBeginForeignScan(ForeignScanState *node, int eflags)
 		appendStringInfo(&col_str, i == 0 ? "`%s`" : ",`%s`", columns[i].data);
     }
     heap_close(rel, NoLock);
-	
+
+#ifdef DEBUG
 	/* print out the actual column names in remote table for debug only*/
 	for (i = 0; i < num_of_columns; i++) {
 		elog(NOTICE, "Column Mapping %i: %s", i, columns[i].data);
 	}
 	elog(NOTICE, "Column String: %s", col_str.data);
+#endif
+	
+	/* See if we've got a qual we can push down */
+	if (node->ss.ps.plan->qual)
+	{
+		ListCell	*lc;
+		
+		foreach (lc, node->ss.ps.qual)
+		{
+			/* Only the first qual can be pushed down to remote DBMS */
+			ExprState  *state = lfirst(lc);
+			
+			odbcGetQual((Node *) state->expr, node->ss.ss_currentRelation->rd_att, col_mapping_list, &qual_key, &qual_value, &pushdown);
+			if (pushdown)
+				break;
+		}
+	}
 	
 	/* Construct the SQL statement used for remote querying */
 	initStringInfo(&sql);
-	appendStringInfo(&sql, "SELECT %s FROM `%s`.`%s`", col_str.data, svr_database, svr_table);
-	elog(NOTICE, "%s", sql.data);
+	if (pushdown) {
+		appendStringInfo(&sql, "SELECT %s FROM `%s`.`%s` WHERE `%s` = '%s'", 
+						 col_str.data, svr_database, svr_table, qual_key, qual_value);
+	}
+	else {
+		appendStringInfo(&sql, "SELECT %s FROM `%s`.`%s`", col_str.data, svr_database, svr_table);
+	}
 	
+#ifdef DEBUG
+	elog(NOTICE, "SQL: %s", sql.data);
+#endif
 	
 	/* Allocate a statement handle */
 	SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
 	/* Retrieve a list of rows */
-	SQLExecDirect(stmt, sql.data, SQL_NTS);
+	SQLExecDirect(stmt, (SQLCHAR *) sql.data, SQL_NTS);
 	SQLNumResultCols(stmt, &result_columns);
+	
+#ifdef DEBUG
 	elog(NOTICE, "num of columns (begin): %i", (int) result_columns);
+#endif
 	
 	festate = (odbcFdwExecutionState *) palloc(sizeof(odbcFdwExecutionState));
 	festate->attinmeta = TupleDescGetAttInMetadata(node->ss.ss_currentRelation->rd_att);
+	festate->svr_dsn = svr_dsn;
+	festate->svr_database = svr_database;
+	festate->svr_table = svr_table;
+	festate->svr_username = username;
+	festate->svr_password = password;
 	festate->stmt = stmt;
 	node->fdw_state = (void *) festate;
 }
@@ -561,13 +808,20 @@ odbcIterateForeignScan(ForeignScanState *node)
 	SQLSMALLINT columns;
 	char	**values;
 	HeapTuple	tuple;
+	StringInfoData	col_data;
 	SQLHSTMT stmt = festate->stmt;
-	
+
+#ifdef DEBUG
 	elog(NOTICE, "odbcIterateForeignScan");
+#endif
+	
 	ret = SQLFetch(stmt);
 	
 	SQLNumResultCols(stmt, &columns);
+	
+#ifdef DEBUG
 	elog(NOTICE, "num of columns (iterate): %i", (int) columns);
+#endif
 	
 	ExecClearTuple(slot);
 	
@@ -577,30 +831,32 @@ odbcIterateForeignScan(ForeignScanState *node)
 		/* Loop through the columns */
 		for (i = 1; i <= columns; i++) {
 			SQLLEN indicator;
-			char buf[512];
+			char buf[1024];
 
 			/* retrieve column data as a string */
 			ret = SQLGetData(stmt, i, SQL_C_CHAR,
 							 buf, sizeof(buf), &indicator);
-			//SQLNumResultCols(stmt, &columns);
+			
 			if (SQL_SUCCEEDED(ret)) {
 				
 				/* Handle null columns */
 				if (indicator == SQL_NULL_DATA) strcpy(buf, "NULL");
-				StringInfoData temp;
-				initStringInfo(&temp);
-				appendStringInfoString (&temp, buf);
-				values[i-1] = temp.data;
-				
+				initStringInfo(&col_data);
+				appendStringInfoString (&col_data, buf);
+				values[i-1] = col_data.data;
+#ifdef DEBUG
 				elog(NOTICE, "values[%i] = %s", i-1, values[i-1]);
-
+#endif
 			}
 		}
 		
 		tuple = BuildTupleFromCStrings(festate->attinmeta, values);
 		ExecStoreTuple(tuple, slot, InvalidBuffer, false);
 	}
+#ifdef DEBUG
 	elog(NOTICE, "iterate end");
+#endif
+	
 	return slot;
 }
 
@@ -613,7 +869,23 @@ odbcIterateForeignScan(ForeignScanState *node)
 static void
 odbcExplainForeignScan(ForeignScanState *node, ExplainState *es)
 {
+	odbcFdwExecutionState *festate;
+	unsigned int table_size = 0;
+	
+#ifdef DEBUG
 	elog(NOTICE, "odbcExplainForeignScan");
+#endif
+	
+	festate = (odbcFdwExecutionState *) node->fdw_state;
+	
+	odbcGetTableSize(festate->svr_dsn, festate->svr_database, festate->svr_table, 
+					 festate->svr_username, festate->svr_password, &table_size);
+	
+	/* Suppress file size if we're not showing cost details */
+	if (es->costs)
+	{
+		ExplainPropertyLong("Foreign Table Size", table_size, es);
+	}
 }
 
 /*
@@ -623,7 +895,22 @@ odbcExplainForeignScan(ForeignScanState *node, ExplainState *es)
 static void
 odbcEndForeignScan(ForeignScanState *node)
 {
-    elog(NOTICE, "odbcEndForeignScan");
+	odbcFdwExecutionState *festate;
+
+#ifdef DEBUG
+	elog(NOTICE, "odbcEndForeignScan");
+#endif
+	
+	/* if festate is NULL, we are in EXPLAIN; nothing to do */
+	festate = (odbcFdwExecutionState *) node->fdw_state;
+	
+	if (festate)
+	{
+		if (festate->stmt) {
+			SQLFreeHandle(SQL_HANDLE_STMT, festate->stmt);
+			festate->stmt = NULL;
+		}
+	}
 }
 
 /*
@@ -633,5 +920,7 @@ odbcEndForeignScan(ForeignScanState *node)
 static void
 odbcReScanForeignScan(ForeignScanState *node)
 {
+#ifdef DEBUG
     elog(NOTICE, "odbcReScanForeignScan");
+#endif
 }
