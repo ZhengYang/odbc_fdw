@@ -2,7 +2,7 @@ ODBC FDW (beta) for PostgreSQL 9.1+
 ===================================
 
 This PostgreSQL extension implements a Foreign Data Wrapper (FDW) for
-remote databases using Open Database Connectivity(ODBC): http://en.wikipedia.org/wiki/Open_Database_Connectivity
+remote databases using Open Database Connectivity(ODBC): http://msdn.microsoft.com/en-us/library/ms714562(v=VS.85).aspx
 
 IMPORTANT: There're bugs in the existing version. I'm working on it and will
 be releasing another version very soon.
@@ -11,18 +11,53 @@ be releasing another version very soon.
 Building
 --------
 
+To build the code, you need to have one of the ODBC driver managers installed
+on your computer. 
 
-Limitations
+A list of driver managers is available here: http://en.wikipedia.org/wiki/Open_Database_Connectivity
+
+Once that's done, the extension can be built with:
+
+PATH=/usr/local/pgsql91/bin/:$PATH make USE_PGXS=1 make
+sudo PATH=/usr/local/pgsql91/bin/:$PATH make USE_PGXS=1 install
+
+(assuming you have PostgreSQL 9.1 in /usr/local/pgsql91).
+
+I've tested on Mac OS X 10.6 with UnixODBC connecting to MySQL only, but other *nix's should also work.
+I haven't tested on Windows, but the code should be good on MinGW.
+
+TODO
 -----------
 
+I will test against other platforms with different driver managers and more foreign DBMS's.
 
 Usage
 -----
 
-The following parameters can be set on a CouchDB foreign server:
+The following parameters can be set on ODBC foreign server:
 
-dsn:	Database Source Name
-	 	Default: myodbc
+dsn:	The Database Source Name for the foreign database system you're connecting to.
+	 Default: <none>
+
+The following parameter can be set on a ODBC foreign table:
+
+database:	The name of the database(schema) to query.
+	  	Default: <none>
+
+table:		The name of the table to query.
+		Default: <none>
+
+<column name>:	The column mapping to remote table columns.
+		If there is no column mapping specified, default is the origninal column name.
+
+The following parameter can be set on a user mapping for a ODBC
+foreign server:
+
+username:	The username to authenticate to the foreign server with.
+		Default: <none>
+		
+password:	The password to authenticate to the foreign server with.
+		Default: <none>
 
 
 Example
@@ -30,15 +65,29 @@ Example
 
 CREATE SERVER odbc_server 
 	FOREIGN DATA WRAPPER odbc_fdw 
-	OPTIONS (dsn 'mydsn');
+	OPTIONS (dsn 'test');
 
-CREATE FOREIGN TABLE odbc_table (name text, age text) 
-	SERVER odbc_server
-	OPTIONS (database 'testdb', name 'myname', age 'myage');
+CREATE FOREIGN TABLE odbc_table (
+	db_id integer, 
+	db_name varchar(255), 
+	db_desc text, 
+	db_users float4, 
+	db_createdtime timestamp
+) 
+SERVER odbc_server
+OPTIONS (
+	database 'test', 
+	table 'dblist', 
+	db_id 'id', 
+	db_name 'name',
+	db_desc 'description',
+	db_users 'users',
+	db_createdtime 'created_datetime'
+);
 
-CREATE USER MAPPING FOR PUBLIC
+CREATE USER MAPPING FOR postgres
 	SERVER odbc_server
-	OPTIONS ();
+	OPTIONS (username 'root', password '');
 
 -- 
 Zheng Yang
