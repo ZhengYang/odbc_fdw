@@ -15,8 +15,9 @@
  */
 
 /* Debug mode flag */
-/* #define DEBUG */
-
+/*
+#define DEBUG
+*/
 #include "postgres.h"
 #include <string.h>
 
@@ -51,10 +52,18 @@ typedef struct odbcFdwExecutionState
 	AttInMetadata	*attinmeta;
 	char			*svr_dsn;
 	char			*svr_database;
+	char			*svr_schema;
 	char			*svr_table;
 	char			*svr_username;
 	char			*svr_password;
 	SQLHSTMT		stmt;
+	int				num_of_result_cols;
+	int				num_of_table_cols;
+	StringInfoData	*table_columns;
+	bool			first_iteration;
+	List			*col_position_mask;
+	List			*col_size_array;
+	char			*sql_count;
 } odbcFdwExecutionState;
 
 struct odbcFdwOption
@@ -74,7 +83,10 @@ static struct odbcFdwOption valid_options[] =
 
     /* Foreign table options */
 	{ "database",   ForeignTableRelationId },
+	{ "schema",		ForeignTableRelationId },
 	{ "table",		ForeignTableRelationId },
+	{ "sql_query",	ForeignTableRelationId },
+	{ "sql_count",	ForeignTableRelationId },
 	
 	/* User mapping options */
 	{ "username", UserMappingRelationId },
@@ -135,7 +147,10 @@ odbc_fdw_validator(PG_FUNCTION_ARGS)
     Oid		catalog = PG_GETARG_OID(1);
     char	*dsn = NULL;
     char	*svr_database = NULL;
+	char	*svr_schema = NULL;
 	char	*svr_table = NULL;
+	char	*sql_query = NULL;
+	char	*sql_count = NULL;
     char	*username = NULL;
     char	*password = NULL;
     ListCell	*cell;
@@ -197,6 +212,15 @@ odbc_fdw_validator(PG_FUNCTION_ARGS)
 			
             svr_database = defGetString(def);
         }
+		else if (strcmp(def->defname, "schema") == 0)
+		{
+			if (svr_schema)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options: schema (%s)", defGetString(def))
+						));
+			svr_schema = defGetString(def);
+		}
 		else if (strcmp(def->defname, "table") == 0)
         {
             if (svr_table)
@@ -205,9 +229,29 @@ odbc_fdw_validator(PG_FUNCTION_ARGS)
                          errmsg("conflicting or redundant options: table (%s)", defGetString(def))
 						 ));
 			
-            svr_database = defGetString(def);
+            svr_table = defGetString(def);
         }
-        else if (strcmp(def->defname, "username") == 0)
+        else if (strcmp(def->defname, "sql_query") == 0)
+        {
+            if (sql_query)
+                ereport(ERROR,
+                        (errcode(ERRCODE_SYNTAX_ERROR),
+                         errmsg("conflicting or redundant options: sql_query (%s)", defGetString(def))
+						 ));
+			
+            sql_query = defGetString(def);
+        }
+		else if (strcmp(def->defname, "sql_count") == 0)
+        {
+            if (sql_count)
+                ereport(ERROR,
+                        (errcode(ERRCODE_SYNTAX_ERROR),
+                         errmsg("conflicting or redundant options: sql_count (%s)", defGetString(def))
+						 ));
+			
+            sql_count = defGetString(def);
+        }
+		else if (strcmp(def->defname, "username") == 0)
         {
             if (username)
                 ereport(ERROR,
@@ -241,12 +285,13 @@ odbc_fdw_validator(PG_FUNCTION_ARGS)
 }
 
 
+
 /*
  * Fetch the options for a odbc_fdw foreign table.
  */
 static void
-odbcGetOptions(Oid foreigntableid, char **svr_dsn, char **svr_database, char ** svr_table, 
-                  char **username, char **password, List **mapping_list)
+odbcGetOptions(Oid foreigntableid, char **svr_dsn, char **svr_database, char **svr_schema, char ** svr_table, char ** sql_query,
+                  char **sql_count, char **username, char **password, List **mapping_list)
 {
     ForeignTable	*table;
     ForeignServer	*server;
@@ -288,9 +333,25 @@ odbcGetOptions(Oid foreigntableid, char **svr_dsn, char **svr_database, char ** 
             continue;
         }
 		
+		if (strcmp(def->defname, "schema") == 0)
+        {
+            *svr_schema = defGetString(def);
+            continue;
+        }
+		
         if (strcmp(def->defname, "table") == 0)
         {
             *svr_table = defGetString(def);
+            continue;
+        }
+		if (strcmp(def->defname, "sql_query") == 0)
+        {
+            *sql_query = defGetString(def);
+            continue;
+        }
+		if (strcmp(def->defname, "sql_count") == 0)
+        {
+            *sql_count = defGetString(def);
             continue;
         }
         if (strcmp(def->defname, "username") == 0)
@@ -320,8 +381,19 @@ odbcGetOptions(Oid foreigntableid, char **svr_dsn, char **svr_database, char ** 
     if (!*svr_database)
         *svr_database = NULL;
 	
+	if (!*svr_schema)
+        *svr_schema = NULL;
+	
 	if (!*svr_table)
 		*svr_table = NULL;
+	
+	if (!*sql_query) {
+		*sql_query = NULL;
+	}
+	
+	if (!*sql_count) {
+		*sql_count = NULL;
+	}
 	
     if (!*username)
         *username = NULL;
@@ -330,8 +402,8 @@ odbcGetOptions(Oid foreigntableid, char **svr_dsn, char **svr_database, char ** 
         *password = NULL;
 }
 
-void static extract_error(
-						  char *fn,
+#ifdef DEBUG
+void static extract_error(char *fn,
 						  SQLHANDLE handle,
 						  SQLSMALLINT type)
 {
@@ -357,12 +429,59 @@ void static extract_error(
     }
     while( ret == SQL_SUCCESS );
 }
+#endif
+
+
+/*
+ * Get name qualifier char 
+ */
+static void
+getNameQualifierChar(SQLHDBC dbc, StringInfoData *nq_char) 
+{
+	SQLCHAR name_qualifier_char[2];
+
+#ifdef DUBUG
+	elog(NOTICE, "getNameQualifierChar");
+#endif
+	
+	SQLGetInfo(dbc, 
+			   SQL_QUALIFIER_NAME_SEPARATOR,
+			   (SQLPOINTER)&name_qualifier_char,
+			   2,
+			   NULL);
+	initStringInfo(nq_char);
+	appendStringInfo(nq_char, "%s", (char *) name_qualifier_char);
+}
+
+
+/*
+ * Get quote cahr
+ */
+static void
+getQuoteChar(SQLHDBC dbc, StringInfoData *q_char)
+{
+	SQLCHAR quote_char[2];
+#ifdef DEBUG
+	elog(NOTICE, "getQuoteChar");
+#endif
+	
+	SQLGetInfo(dbc, 
+			   SQL_IDENTIFIER_QUOTE_CHAR,
+			   (SQLPOINTER)&quote_char,
+			   2,
+			   NULL);
+	
+	initStringInfo(q_char);
+	appendStringInfo(q_char, "%s", (char *) quote_char);
+}
+
 
 /*
  * get table size of a table
  */
 static void
-odbcGetTableSize(char *svr_dsn, char *svr_database, char *svr_table, char *username, char *password, unsigned int *size)
+odbcGetTableSize(char *svr_dsn, char *svr_database, char *svr_schema, char *svr_table, 
+				 char *username, char *password, char *sql_count, unsigned int *size)
 {
 	SQLHENV env;
 	SQLHDBC dbc;
@@ -376,6 +495,9 @@ odbcGetTableSize(char *svr_dsn, char *svr_database, char *svr_table, char *usern
 	
 	SQLUBIGINT table_size;
 	SQLLEN indicator;
+	
+	StringInfoData name_qualifier_char;
+	StringInfoData quote_char;
 	
 	/* Construct connection string */
 	initStringInfo(&conn_str);
@@ -405,9 +527,28 @@ odbcGetTableSize(char *svr_dsn, char *svr_database, char *svr_table, char *usern
 	/* Allocate a statement handle */
 	SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
 	
-	initStringInfo(&sql_str);
-	appendStringInfo(&sql_str, "SELECT COUNT(*) FROM `%s`.`%s`", svr_database, svr_table);
+	if (sql_count == NULL)
+	{
+		/* Get quote char */
+		getQuoteChar(dbc, &quote_char);
 	
+		/* Get name qualifier char */
+		getNameQualifierChar(dbc, &name_qualifier_char);
+	
+		initStringInfo(&sql_str);
+		appendStringInfo(&sql_str, "SELECT COUNT(*) FROM %s%s%s%s%s%s%s", 
+						 quote_char.data, svr_schema, quote_char.data, 
+						 name_qualifier_char.data, 
+						 quote_char.data, svr_table, quote_char.data);
+	}
+	else {
+		initStringInfo(&sql_str);
+		appendStringInfo(&sql_str, "%s", sql_count);
+	}
+
+#ifdef DEBUG
+	elog(NOTICE, "%s", sql_str.data);
+#endif
 	ret = SQLExecDirect(stmt, (SQLCHAR *) sql_str.data, SQL_NTS);
 	if (SQL_SUCCEEDED(ret)) {
 		SQLFetch(stmt);
@@ -561,7 +702,10 @@ odbcPlanForeignScan(Oid foreigntableid, PlannerInfo *root, RelOptInfo *baserel)
 	unsigned int table_size	= 0;
 	char *svr_dsn			= NULL;
 	char *svr_database		= NULL;
+	char *svr_schema		= NULL;
 	char *svr_table			= NULL;
+	char *sql_query			= NULL;
+	char *sql_count			= NULL;
 	char *username			= NULL;
 	char *password			= NULL;
 	List *col_mapping_list;
@@ -571,8 +715,8 @@ odbcPlanForeignScan(Oid foreigntableid, PlannerInfo *root, RelOptInfo *baserel)
 #endif
 	
 	/* Fetch the foreign table options */
-	odbcGetOptions(foreigntableid, &svr_dsn, &svr_database, &svr_table, 
-				   &username, &password, &col_mapping_list);
+	odbcGetOptions(foreigntableid, &svr_dsn, &svr_database, &svr_schema, &svr_table, &sql_query,
+				   &sql_count, &username, &password, &col_mapping_list);
 	
 	fdwplan = makeNode(FdwPlan);
 	fdwplan->startup_cost = 10;
@@ -583,7 +727,7 @@ odbcPlanForeignScan(Oid foreigntableid, PlannerInfo *root, RelOptInfo *baserel)
 	elog(NOTICE, "new total cost: %f", fdwplan->total_cost);
 #endif
 	
-	odbcGetTableSize(svr_dsn, svr_database, svr_table, username, password, &table_size);
+	odbcGetTableSize(svr_dsn, svr_database, svr_schema, svr_table, username, password, sql_count, &table_size);
 	
 	fdwplan->total_cost = fdwplan->total_cost + table_size;
 #ifdef DEBUG
@@ -591,10 +735,6 @@ odbcPlanForeignScan(Oid foreigntableid, PlannerInfo *root, RelOptInfo *baserel)
 #endif
     return fdwplan;
 }
-
-
-
-
 
 
 /*
@@ -623,7 +763,10 @@ odbcBeginForeignScan(ForeignScanState *node, int eflags)
 	
 	char *svr_dsn		= NULL;
 	char *svr_database	= NULL;
-	char *svr_table	= NULL;
+	char *svr_schema	= NULL;
+	char *svr_table		= NULL;
+	char *sql_query		= NULL;
+	char *sql_count		= NULL;
 	char *username		= NULL;
 	char *password		= NULL;
 	
@@ -637,6 +780,8 @@ odbcBeginForeignScan(ForeignScanState *node, int eflags)
 	List	*col_mapping_list;
 	StringInfoData	sql;
 	StringInfoData	col_str;
+	SQLCHAR quote_char[2];
+	SQLCHAR name_qualifier_char[2];
 	
 	char	*qual_key = NULL;
 	char	*qual_value = NULL;
@@ -647,12 +792,15 @@ odbcBeginForeignScan(ForeignScanState *node, int eflags)
 #endif
 	
 	/* Fetch the foreign table options */
-	odbcGetOptions(RelationGetRelid(node->ss.ss_currentRelation), &svr_dsn, &svr_database, &svr_table, 
-				   &username, &password, &col_mapping_list);
+	odbcGetOptions(RelationGetRelid(node->ss.ss_currentRelation), &svr_dsn, &svr_database, &svr_schema, &svr_table, &sql_query,
+				   &sql_count, &username, &password, &col_mapping_list);
 #ifdef DEBUG	
 	elog(NOTICE, "dsn: %s", svr_dsn);
 	elog(NOTICE, "db: %s", svr_database);
+	elog(NOTICE, "schema: %s", svr_schema);
 	elog(NOTICE, "table: %s", svr_table);
+	elog(NOTICE, "sql_query: %s", sql_query);
+	elog(NOTICE, "sql_count: %s", sql_count);
 	elog(NOTICE, "username: %s", username);
 	elog(NOTICE, "password: %s", password);
 #endif
@@ -695,6 +843,27 @@ odbcBeginForeignScan(ForeignScanState *node, int eflags)
 	}
 #endif
 	
+	/* Getting the Quote char */
+	SQLGetInfo(dbc, 
+			   SQL_IDENTIFIER_QUOTE_CHAR,
+			   (SQLPOINTER)&quote_char,
+			   2,
+			   NULL);
+	
+	
+	/* Getting the Qualifier name separator */
+	SQLGetInfo(dbc, 
+			   SQL_QUALIFIER_NAME_SEPARATOR,
+			   (SQLPOINTER)&name_qualifier_char,
+			   2,
+			   NULL);
+	
+#ifdef DEBUG
+	elog(NOTICE, "QUOTE CHAR: %s", quote_char);
+	elog(NOTICE, "SQL_QUALIFIER_NAME_SEPARATOR: %s", name_qualifier_char); 
+#endif
+	
+	
 	/* Fetch the table column info */
     rel = heap_open(RelationGetRelid(node->ss.ss_currentRelation), AccessShareLock);
     num_of_columns = rel->rd_att->natts;
@@ -729,16 +898,28 @@ odbcBeginForeignScan(ForeignScanState *node, int eflags)
             columns[i] = mapping;
         else
             columns[i] = col;
-		appendStringInfo(&col_str, i == 0 ? "`%s`" : ",`%s`", columns[i].data);
+		appendStringInfo(&col_str, i == 0 ? "%s%s%s" : ",%s%s%s", (char *) quote_char, columns[i].data, (char *) quote_char);
     }
     heap_close(rel, NoLock);
 
+	
 #ifdef DEBUG
 	/* print out the actual column names in remote table for debug only*/
 	for (i = 0; i < num_of_columns; i++) {
 		elog(NOTICE, "Column Mapping %i: %s", i, columns[i].data);
 	}
 	elog(NOTICE, "Column String: %s", col_str.data);
+	elog(NOTICE, "Experiment: ");
+	
+	/*
+	// SUBSTRING supported
+	if (fFuncs & SQL_FN_STR_CHAR_LENGTH) 
+		elog(NOTICE, "HAS COUNT!");   // do something
+	
+	// SUBSTRING not supported
+	else
+		elog(NOTICE, "DUN HAVE!");   // do something else
+	 */
 #endif
 	
 	/* See if we've got a qual we can push down */
@@ -764,7 +945,15 @@ odbcBeginForeignScan(ForeignScanState *node, int eflags)
 						 col_str.data, svr_database, svr_table, qual_key, qual_value);
 	}
 	else {
-		appendStringInfo(&sql, "SELECT %s FROM `%s`.`%s`", col_str.data, svr_database, svr_table);
+		/* Use custom query if it's available */
+		if (sql_query) {
+			appendStringInfo(&sql, "%s", sql_query);
+		}
+		else {
+			appendStringInfo(&sql, "SELECT %s FROM %s%s%s%s%s%s%s", col_str.data, 
+							(char *) quote_char, svr_schema, (char *) quote_char, 
+							 (char *) name_qualifier_char, (char *) quote_char, svr_table, (char *) quote_char);
+		}
 	}
 	
 #ifdef DEBUG
@@ -785,10 +974,16 @@ odbcBeginForeignScan(ForeignScanState *node, int eflags)
 	festate->attinmeta = TupleDescGetAttInMetadata(node->ss.ss_currentRelation->rd_att);
 	festate->svr_dsn = svr_dsn;
 	festate->svr_database = svr_database;
+	festate->svr_schema = svr_schema;
 	festate->svr_table = svr_table;
 	festate->svr_username = username;
 	festate->svr_password = password;
 	festate->stmt = stmt;
+	festate->table_columns = columns;
+	festate->num_of_table_cols = num_of_columns;
+	/* prepare for the first iteration, there will be some precalculation needed in the first iteration*/
+	festate->first_iteration = TRUE;
+	festate->sql_count = sql_count;
 	node->fdw_state = (void *) festate;
 }
 
@@ -810,6 +1005,12 @@ odbcIterateForeignScan(ForeignScanState *node)
 	HeapTuple	tuple;
 	StringInfoData	col_data;
 	SQLHSTMT stmt = festate->stmt;
+	bool first_iteration = festate->first_iteration;
+	int num_of_table_cols = festate->num_of_table_cols;
+	int num_of_result_cols;
+	StringInfoData	*table_columns = festate->table_columns;
+	List *col_position_mask = NIL;
+	List *col_size_array = NIL;
 
 #ifdef DEBUG
 	elog(NOTICE, "odbcIterateForeignScan");
@@ -823,6 +1024,80 @@ odbcIterateForeignScan(ForeignScanState *node)
 	elog(NOTICE, "num of columns (iterate): %i", (int) columns);
 #endif
 	
+	/*
+	 * If this is the first iteration, 
+	 * we need to calculate the mask for column mapping as well as the column size
+	 */
+	if (first_iteration == TRUE)
+	{
+		SQLCHAR *ColumnName;
+		SQLSMALLINT NameLengthPtr;
+		SQLSMALLINT DataTypePtr;
+		SQLULEN		ColumnSizePtr;
+		SQLSMALLINT	DecimalDigitsPtr;
+		SQLSMALLINT	NullablePtr;
+		int i;
+		int k;
+		bool found = FALSE;
+		
+		/* Allocate memory for the masks */
+		col_position_mask = NIL;
+		col_size_array = NIL;
+		num_of_result_cols = columns;
+		/* Obtain the column information of the first row. */
+		for (i = 1; i <= columns; i++) {
+			ColumnName = (SQLCHAR *) palloc(sizeof(SQLCHAR) * 255);
+			SQLDescribeCol(stmt,
+						   i,						/* ColumnName */
+						   ColumnName,
+						   sizeof(SQLCHAR) * 255,	/* BufferLength */
+						   &NameLengthPtr,
+						   &DataTypePtr,
+						   &ColumnSizePtr,
+						   &DecimalDigitsPtr,		 
+						   &NullablePtr);
+			
+#ifdef DEBUG
+			elog(NOTICE, "SQLDescribeCol: ");
+			elog(NOTICE, "Result Column Name: %s", (char *) ColumnName);
+			elog(NOTICE, "Result DataType: %i",  DataTypePtr);
+			elog(NOTICE, "Result Column Size: %i",  (int) ColumnSizePtr);
+			elog(NOTICE, "Result Decimal Size: %i",  DecimalDigitsPtr);
+			elog(NOTICE, "Result Nullable: %i",  NullablePtr);
+#endif
+			
+			/* Get the position of the column in the FDW table */
+			for (k=0; k<num_of_table_cols; k++) {
+				if (strcmp(table_columns[k].data, (char *) ColumnName) == 0) {
+					found = TRUE;
+#ifdef DEBUG
+					elog(NOTICE, "I value: %i", i-1);
+					elog(NOTICE, "K value: %i", k);
+#endif
+					col_position_mask = lappend_int(col_position_mask, k);
+					col_size_array = lappend_int(col_size_array, (int) ColumnSizePtr);
+					break;
+				}
+			}
+			/* if current column is not used by the foreign table */
+			if (!found) {
+				col_position_mask = lappend_int(col_position_mask, -1);
+				col_size_array = lappend_int(col_size_array, -1);
+			}
+			
+			pfree(ColumnName);
+		}
+		festate->num_of_result_cols = num_of_result_cols;
+		festate->col_position_mask = list_copy(col_position_mask);
+		festate->col_size_array = list_copy(col_size_array);
+		festate->first_iteration = FALSE;
+	}
+	else {
+		num_of_result_cols = festate->num_of_result_cols;
+		col_position_mask = list_copy(festate->col_position_mask);
+		col_size_array = festate->col_size_array;
+	}
+	
 	ExecClearTuple(slot);
 	
 	if (SQL_SUCCEEDED(ret)) {
@@ -831,28 +1106,50 @@ odbcIterateForeignScan(ForeignScanState *node)
 		/* Loop through the columns */
 		for (i = 1; i <= columns; i++) {
 			SQLLEN indicator;
-			char buf[1024];
+			char * buf;
+			
+			int mask_index = i - 1;
+			int col_size = list_nth_int(col_size_array, mask_index);
+			int mapped_pos = list_nth_int(col_position_mask, mask_index);
+			
+#ifdef DEBUG
+			/* Dump the content of the mask */
+			elog(NOTICE, "Mask index: %i", mask_index);
+			int p;
+			elog(NOTICE, "Content of the mask:");
+			for (p=0; p<num_of_result_cols; p++) {
+				elog(NOTICE, "%i => %i (%i)", p, list_nth_int(col_position_mask, p), list_nth_int(col_size_array, p));
+			}
+#endif
+			/* Ignore this column if position is marked as invalid */
+			if (mapped_pos == -1)
+				continue;
+			
+			buf = (char *) palloc(sizeof(char) * col_size);
 
 			/* retrieve column data as a string */
 			ret = SQLGetData(stmt, i, SQL_C_CHAR,
-							 buf, sizeof(buf), &indicator);
+							 buf, sizeof(char) * col_size, &indicator);
 			
 			if (SQL_SUCCEEDED(ret)) {
-				
 				/* Handle null columns */
 				if (indicator == SQL_NULL_DATA) strcpy(buf, "NULL");
 				initStringInfo(&col_data);
 				appendStringInfoString (&col_data, buf);
-				values[i-1] = col_data.data;
+				
+				values[mapped_pos] = col_data.data;
 #ifdef DEBUG
-				elog(NOTICE, "values[%i] = %s", i-1, values[i-1]);
+				elog(NOTICE, "values[%i] = %s", mapped_pos, values[mapped_pos]);
 #endif
 			}
+			pfree(buf);
 		}
 		
 		tuple = BuildTupleFromCStrings(festate->attinmeta, values);
 		ExecStoreTuple(tuple, slot, InvalidBuffer, false);
+		pfree(values);
 	}
+	
 #ifdef DEBUG
 	elog(NOTICE, "iterate end");
 #endif
@@ -878,8 +1175,8 @@ odbcExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	
 	festate = (odbcFdwExecutionState *) node->fdw_state;
 	
-	odbcGetTableSize(festate->svr_dsn, festate->svr_database, festate->svr_table, 
-					 festate->svr_username, festate->svr_password, &table_size);
+	odbcGetTableSize(festate->svr_dsn, festate->svr_database, festate->svr_schema, festate->svr_table, 
+					 festate->svr_username, festate->svr_password, festate->sql_count, &table_size);
 	
 	/* Suppress file size if we're not showing cost details */
 	if (es->costs)
