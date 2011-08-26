@@ -20,8 +20,7 @@ sudo PATH=/usr/local/pgsql91/bin/:$PATH make USE_PGXS=1 install
 
 (assuming you have PostgreSQL 9.1 in /usr/local/pgsql91).
 
-I've tested on Mac OS X 10.6 with UnixODBC connecting to MySQL only, but other *nix's should also work.
-I haven't tested on Windows, but the code should be good on MinGW.
+I've tested on Mac OS X 10.6 and Windows 7. More testings on other platforms are coming soon.
 
 TODO
 -----------
