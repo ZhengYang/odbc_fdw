@@ -1139,8 +1139,8 @@ odbcIterateForeignScan(ForeignScanState *node)
 
 #ifdef DEBUG
             /* Dump the content of the mask */
+			int p;
             elog(NOTICE, "Mask index: %i", mask_index);
-            int p;
             elog(NOTICE, "Content of the mask:");
             for (p=0; p<num_of_result_cols; p++)
             {
