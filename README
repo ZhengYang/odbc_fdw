@@ -1,3 +1,12 @@
+
+************************************************
+* Note: this fork was for some private purpose 
+* and had some significant issues.
+* Pls. check out https://github.com/CartoDB/odbc_fdw 
+* instead!
+************************************************
+
+
 ODBC FDW (beta) for PostgreSQL 9.1+
 ===================================
 
