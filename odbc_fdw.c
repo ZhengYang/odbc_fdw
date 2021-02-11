@@ -7,6 +7,8 @@
  * This software is released under the PostgreSQL Licence.
  *
  * Author: Zheng Yang <zhengyang4k@gmail.com>
+ * Updated to 9.2+ by Gunnar "Nick" Bluth <nick@pro-open.de>
+ *	 based on tds_fdw code from Geoff Montee
  *
  * IDENTIFICATION
  *        odbc_fdw/odbc_fdw.c
@@ -36,6 +38,19 @@
 #include "utils/relcache.h"
 #include "storage/lock.h"
 #include "miscadmin.h"
+#include "mb/pg_wchar.h"
+#include "optimizer/cost.h"
+#include "storage/fd.h"
+#include "utils/array.h"
+#include "utils/builtins.h"
+#include "utils/rel.h"
+
+#if (PG_VERSION_NUM >= 90200)
+#include "optimizer/pathnode.h"
+#include "optimizer/restrictinfo.h"
+#include "optimizer/planmain.h"
+#endif
+
 
 #include <stdio.h>
 #include <sql.h>
@@ -109,12 +124,25 @@ PG_FUNCTION_INFO_V1(odbc_fdw_validator);
 /*
  * FDW callback routines
  */
-static FdwPlan *odbcPlanForeignScan(Oid foreigntableid, PlannerInfo *root, RelOptInfo *baserel);
 static void odbcExplainForeignScan(ForeignScanState *node, ExplainState *es);
 static void odbcBeginForeignScan(ForeignScanState *node, int eflags);
 static TupleTableSlot *odbcIterateForeignScan(ForeignScanState *node);
 static void odbcReScanForeignScan(ForeignScanState *node);
 static void odbcEndForeignScan(ForeignScanState *node);
+/* routines for 9.2.0+ */
+#if (PG_VERSION_NUM >= 90200)
+static void odbcGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid);
+static void odbcEstimateCosts(PlannerInfo *root, RelOptInfo *baserel, Cost *startup_cost, Cost *total_cost, Oid foreigntableid);
+static void odbcGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid);
+static bool odbcAnalyzeForeignTable(Relation relation, AcquireSampleRowsFunc *func, BlockNumber *totalpages);
+static ForeignScan* odbcGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid, ForeignPath *best_path, List *tlist, List *scan_clauses);
+/* routines for versions older than 9.2.0 */
+#else
+static FdwPlan *odbcPlanForeignScan(Oid foreigntableid, PlannerInfo *root, RelOptInfo *baserel);
+#endif
+
+
+
 
 /*
  * helper functions
@@ -125,8 +153,15 @@ Datum
 odbc_fdw_handler(PG_FUNCTION_ARGS)
 {
     FdwRoutine *fdwroutine = makeNode(FdwRoutine);
-
+	/* FIXME */
+	#if (PG_VERSION_NUM >= 90200)
+	fdwroutine->GetForeignRelSize = odbcGetForeignRelSize;
+	fdwroutine->GetForeignPaths = odbcGetForeignPaths;
+	fdwroutine->AnalyzeForeignTable = odbcAnalyzeForeignTable;
+	fdwroutine->GetForeignPlan = odbcGetForeignPlan;
+	#else
     fdwroutine->PlanForeignScan = odbcPlanForeignScan;
+	#endif
     fdwroutine->ExplainForeignScan = odbcExplainForeignScan;
     fdwroutine->BeginForeignScan = odbcBeginForeignScan;
     fdwroutine->IterateForeignScan = odbcIterateForeignScan;
@@ -701,6 +736,134 @@ odbcIsValidOption(const char *option, Oid context)
 }
 
 
+/* routines for 9.2.0+ */
+#if (PG_VERSION_NUM >= 90200)
+
+static void odbcGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
+{
+    unsigned int table_size	= 0;
+    char *svr_dsn			= NULL;
+    char *svr_database		= NULL;
+    char *svr_schema		= NULL;
+    char *svr_table			= NULL;
+    char *sql_query			= NULL;
+    char *sql_count			= NULL;
+    char *username			= NULL;
+    char *password			= NULL;
+    List *col_mapping_list;
+
+#ifdef DEBUG
+    elog(NOTICE, "odbcGetForeignRelSize");
+#endif
+
+    /* Fetch the foreign table options */
+    odbcGetOptions(foreigntableid, &svr_dsn, &svr_database, &svr_schema, &svr_table, &sql_query,
+                   &sql_count, &username, &password, &col_mapping_list);
+
+    odbcGetTableSize(svr_dsn, svr_database, svr_schema, svr_table, username, password, sql_count, &table_size);
+
+    baserel->rows = table_size;
+    baserel->tuples = baserel->rows;
+}
+
+static void odbcEstimateCosts(PlannerInfo *root, RelOptInfo *baserel, Cost *startup_cost, Cost *total_cost, Oid foreigntableid)
+{
+    unsigned int table_size	= 0;
+    char *svr_dsn			= NULL;
+    char *svr_database		= NULL;
+    char *svr_schema		= NULL;
+    char *svr_table			= NULL;
+    char *sql_query			= NULL;
+    char *sql_count			= NULL;
+    char *username			= NULL;
+    char *password			= NULL;
+    List *col_mapping_list;
+
+#ifdef DEBUG
+    elog(NOTICE, "odbcEstimateCosts");
+#endif
+
+    /* Fetch the foreign table options */
+    odbcGetOptions(foreigntableid, &svr_dsn, &svr_database, &svr_schema, &svr_table, &sql_query,
+                   &sql_count, &username, &password, &col_mapping_list);
+
+    odbcGetTableSize(svr_dsn, svr_database, svr_schema, svr_table, username, password, sql_count, &table_size);
+	
+	*startup_cost = 25;
+		
+	*total_cost = baserel->rows + *startup_cost;
+	
+	#ifdef DEBUG
+		ereport(NOTICE,
+			(errmsg("----> finishing odbcEstimateCosts")
+			));
+	#endif
+}
+
+static void odbcGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
+{
+	Cost startup_cost;
+	Cost total_cost;
+	
+	#ifdef DEBUG
+		ereport(NOTICE,
+			(errmsg("----> starting odbcGetForeignPaths")
+			));
+	#endif
+	
+	odbcEstimateCosts(root, baserel, &startup_cost, &total_cost, foreigntableid);
+	
+	add_path(baserel, 
+		(Path *) create_foreignscan_path(root, baserel, baserel->rows, startup_cost, total_cost,
+			NIL, NULL, NIL));
+	
+	#ifdef DEBUG
+		ereport(NOTICE,
+			(errmsg("----> finishing odbcGetForeignPaths")
+			));
+	#endif
+}
+
+static bool odbcAnalyzeForeignTable(Relation relation, AcquireSampleRowsFunc *func, BlockNumber *totalpages)
+{
+	#ifdef DEBUG
+		ereport(NOTICE,
+			(errmsg("----> starting odbcAnalyzeForeignTable")
+			));
+	#endif
+	
+	#ifdef DEBUG
+		ereport(NOTICE,
+			(errmsg("----> finishing odbcAnalyzeForeignTable")
+			));
+	#endif
+	
+	return false;
+}
+
+static ForeignScan* odbcGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, 
+	Oid foreigntableid, ForeignPath *best_path, List *tlist, List *scan_clauses)
+{
+	Index scan_relid = baserel->relid;
+	#ifdef DEBUG
+		ereport(NOTICE,
+			(errmsg("----> starting odbcGetForeignPlan")
+			));
+	#endif
+	
+	scan_clauses = extract_actual_clauses(scan_clauses, false);
+	
+	#ifdef DEBUG
+		ereport(NOTICE,
+			(errmsg("----> finishing odbcGetForeignPlan")
+			));
+	#endif
+	
+	return make_foreignscan(tlist, scan_clauses, scan_relid, NIL, NIL);
+}
+
+/* routines for versions older than 9.2.0 */
+#else
 
 /*
  * odbcPlanForeignScan
@@ -747,6 +910,7 @@ odbcPlanForeignScan(Oid foreigntableid, PlannerInfo *root, RelOptInfo *baserel)
     return fdwplan;
 }
 
+#endif
 
 /*
  * odbcBeginForeignScan
